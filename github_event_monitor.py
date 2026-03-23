@@ -209,7 +209,6 @@ def monitor(
     token: str,
     poll_delay: float = _POLL_DELAY,
     scan: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Main monitor loop with ETag conditional requests.
 
@@ -287,9 +286,11 @@ def monitor(
             force_pushes = _extract_force_pushes(new_events)
 
             inserted = 0
+            newly_inserted: list[dict] = []
             for fp in force_pushes:
                 if _insert_event(conn, fp):
                     inserted += 1
+                    newly_inserted.append(fp)
                     log.info(
                         "New force push: %s/%s  commit=%s",
                         fp["repo_org"],
@@ -322,9 +323,9 @@ def monitor(
             if len(new_events) >= _PAGE_LIMIT:
                 log.warning("Missed records — new events filled entire page")
 
-            # Trigger scanning for newly-inserted events
-            if scan and inserted > 0:
-                _trigger_scan(force_pushes, db_path)
+            # Trigger scanning only for newly-inserted events
+            if scan and newly_inserted:
+                _trigger_scan(newly_inserted, db_path)
 
         except requests.exceptions.RequestException as exc:
             log.error(
@@ -425,7 +426,6 @@ def main() -> None:
         token=token,
         poll_delay=args.poll_delay,
         scan=scan,
-        verbose=args.verbose,
     )
 
 

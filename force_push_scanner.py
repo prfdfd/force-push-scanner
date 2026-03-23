@@ -113,7 +113,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _EXPECTED_FIELDS = {"repo_org","repo_name", "before", "timestamp"}
 
 
-def _validate_row(input_org: str, row: dict, idx: int) -> tuple[str, str, int | str]:
+def _validate_row(input_org: str, row: dict, idx: int) -> tuple[str, str, str, int]:
     """Validate that *row* contains the required columns and return the tuple.
 
     Raises ``ValueError`` on validation failure so callers can abort early.
