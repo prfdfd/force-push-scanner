@@ -320,7 +320,7 @@ def monitor(
 
             # Optionally trigger scanning for newly-inserted events
             if scan and cycle_force_pushes:
-                _trigger_scan(cycle_force_pushes, gitlab_url, token)
+                _trigger_scan(cycle_force_pushes, gitlab_url)
 
         except requests.exceptions.RequestException as exc:
             log.error(
@@ -337,27 +337,14 @@ def monitor(
     log.info("Monitor stopped.")
 
 
-def _trigger_scan(events: list[dict], gitlab_url: str, token: str) -> None:
-    """Scan newly-detected force push events via force_push_scanner.
-
-    Embeds the PAT in clone URLs (``https://oauth2:<token>@host/…``) so
-    that ``git clone`` inside ``scan_commits`` can reach private repos
-    visible to the token.
-    """
+def _trigger_scan(events: list[dict], gitlab_url: str) -> None:
+    """Scan newly-detected force push events via force_push_scanner."""
     from collections import defaultdict
-    from urllib.parse import urlparse
     from force_push_scanner import scan_commits
-
-    # Embed credentials in the clone URL for private repo access
-    parsed = urlparse(gitlab_url)
-    authed_base = f"{parsed.scheme}://oauth2:{token}@{parsed.hostname}"
-    if parsed.port:
-        authed_base += f":{parsed.port}"
-    authed_base += parsed.path
 
     repos: dict[str, list[dict]] = defaultdict(list)
     for ev in events:
-        url = f"{authed_base}/{ev['repo_org']}/{ev['repo_name']}"
+        url = f"{gitlab_url}/{ev['repo_org']}/{ev['repo_name']}"
         repos[url].append({"before": ev["before"], "date": ev["timestamp"]})
 
     log.info("Scanning %d events across %d repos", len(events), len(repos))
