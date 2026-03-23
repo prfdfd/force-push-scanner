@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY force_push_scanner.py github_event_monitor.py ./
+COPY force_push_scanner.py github_event_monitor.py gitlab_event_monitor.py ./
 
 # SQLite DB lives here — mount a volume to persist across restarts
 VOLUME ["/data"]
