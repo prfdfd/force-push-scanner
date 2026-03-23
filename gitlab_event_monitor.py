@@ -1,19 +1,26 @@
 """GitLab Events API monitor for force push detection.
 
-Polls the GitLab Projects Events API for push events that indicate
-force pushes (especially zero-commit force pushes, which strongly correlate
-with developers trying to remove accidentally-committed secrets).
+Polls the global GitLab Events API (``GET /api/v4/events?action=pushed``)
+for push events that indicate force pushes — especially zero-commit force
+pushes, which strongly correlate with developers trying to remove
+accidentally-committed secrets.
 
-Handles rate limiting via the ``Retry-After`` header returned by GitLab
-when the 429 status is hit.
+Mirrors the GitHub monitor's architecture: single-stream polling with
+sliding-window deduplication on event IDs.
+
+Rate limits handled:
+  - **General (429)**: backs off using the ``Retry-After`` header.
+  - **Large-file blobs** (``/repository/blobs/:sha``,
+    ``/repository/files/:path``): 5 req/min per object per project for
+    files > 10 MB.  Not hit during event polling, but relevant if the
+    scanner ever fetches blobs via the REST API instead of ``git clone``.
 
 Detected events are stored in a SQLite database compatible with
 ``force_push_scanner.py --db-file``.
 
 Usage:
     export GITLAB_TOKEN=glpat-...
-    python gitlab_event_monitor.py --project-ids 123 456 [--gitlab-url https://gitlab.com] [--db-file pushes.sqlite3] [--scan]
-    python gitlab_event_monitor.py --group-id 789 [--scan]
+    python gitlab_event_monitor.py [--gitlab-url https://gitlab.com] [--db-file pushes.sqlite3] [--scan]
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ import requests
 log = logging.getLogger("gitlab_event_monitor")
 
 _PER_PAGE = 100
-_POLL_DELAY = 60.0  # seconds between full polling cycles
+_POLL_DELAY = 60.0  # seconds between polls
 _USER_AGENT = "force-push-scanner/1.0"
 
 # ── Database ────────────────────────────────────────────────────────────────
@@ -83,7 +90,7 @@ def _insert_event(conn: sqlite3.Connection, event: dict) -> bool:
 
 
 def _build_session(token: str) -> requests.Session:
-    """Return a ``requests.Session`` pre-configured with GitLab auth."""
+    """Return a ``requests.Session`` pre-configured with GitLab PAT auth."""
     sess = requests.Session()
     sess.headers.update(
         {
@@ -94,8 +101,16 @@ def _build_session(token: str) -> requests.Session:
     return sess
 
 
-def _gitlab_get(sess: requests.Session, url: str, params: dict | None = None) -> requests.Response:
-    """GET with automatic 429 Retry-After handling."""
+def _gitlab_get(
+    sess: requests.Session, url: str, params: dict | None = None,
+) -> requests.Response:
+    """GET with automatic 429 Retry-After back-off.
+
+    Also aware of GitLab's per-object blob rate limit (5 req/min for
+    files > 10 MB on ``/repository/blobs`` and ``/repository/files``
+    endpoints).  Those endpoints return 429 with ``Retry-After`` as well,
+    so the same handler covers both.
+    """
     while True:
         resp = sess.get(url, params=params, timeout=(10, 30))
         if resp.status_code == 429:
@@ -106,55 +121,36 @@ def _gitlab_get(sess: requests.Session, url: str, params: dict | None = None) ->
         return resp
 
 
-def _discover_projects(sess: requests.Session, gitlab_url: str, group_id: int) -> list[dict]:
-    """List all projects in *group_id* (including subgroups) via pagination."""
-    projects: list[dict] = []
-    page = 1
-    while True:
-        resp = _gitlab_get(
-            sess,
-            f"{gitlab_url}/api/v4/groups/{group_id}/projects",
-            params={
-                "per_page": _PER_PAGE,
-                "page": page,
-                "include_subgroups": "true",
-                "simple": "true",
-            },
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        projects.extend(batch)
-        page += 1
-    return projects
-
-
-def _fetch_push_events(
+def _fetch_events(
     sess: requests.Session,
     gitlab_url: str,
-    project_id: int,
-) -> list[dict]:
-    """Fetch recent push events for a single project."""
+) -> tuple[list[dict], dict]:
+    """Fetch one page of push events from the global events stream.
+
+    Uses ``GET /api/v4/events?action=pushed`` which returns all push events
+    across every project visible to the authenticated token.
+
+    Returns ``(events_list, response_headers)``.
+    """
     resp = _gitlab_get(
         sess,
-        f"{gitlab_url}/api/v4/projects/{project_id}/events",
+        f"{gitlab_url}/api/v4/events",
         params={"action": "pushed", "per_page": _PER_PAGE},
     )
-    if resp.status_code == 404:
-        log.warning("Project %d not found or not accessible — skipping", project_id)
-        return []
     resp.raise_for_status()
-    return resp.json()
+    return resp.json(), dict(resp.headers)
 
 
-def _extract_force_pushes(events: list[dict], namespace: str, project_name: str) -> list[dict]:
+def _extract_force_pushes(events: list[dict]) -> list[dict]:
     """Filter *events* to zero-commit force pushes.
 
-    GitLab push events have a ``push_data`` object with:
+    GitLab push events carry a ``push_data`` object with:
       - ``action``: ``"force_pushed"`` for force pushes
       - ``commit_count``: 0 for zero-commit rewrites
       - ``commit_from``: the before SHA (the overwritten HEAD)
+
+    The ``project`` key (present on global-stream events) provides the
+    namespace and project name so we don't need per-project lookups.
     """
     results: list[dict] = []
     for ev in events:
@@ -173,34 +169,44 @@ def _extract_force_pushes(events: list[dict], namespace: str, project_name: str)
         if not before_sha or before_sha == "0" * 40:
             continue
 
+        # Extract project metadata from the event itself
+        project = ev.get("project", {})
+        path_with_ns = project.get("path_with_namespace", "")
+        if "/" not in path_with_ns:
+            continue
+        namespace, name = path_with_ns.rsplit("/", 1)
+
         created_at = ev.get("created_at", "")
-        try:
-            ts = int(
-                datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-            )
-        except (ValueError, TypeError):
-            try:
-                # Fallback: some GitLab versions omit fractional seconds
-                ts = int(
-                    datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
-                    .replace(tzinfo=timezone.utc)
-                    .timestamp()
-                )
-            except (ValueError, TypeError):
-                ts = int(time.time())
+        ts = _parse_gitlab_timestamp(created_at)
 
         results.append(
             {
                 "id": f"gl-{ev.get('id', '')}",
                 "repo_org": namespace,
-                "repo_name": project_name,
+                "repo_name": name,
                 "before": before_sha,
                 "timestamp": ts,
             }
         )
     return results
+
+
+def _parse_gitlab_timestamp(created_at: str) -> int:
+    """Parse a GitLab ISO-8601 timestamp to Unix epoch.
+
+    Handles both ``2024-01-01T00:00:00.000Z`` (with fractional seconds)
+    and ``2024-01-01T00:00:00Z`` (without).
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return int(
+                datetime.strptime(created_at, fmt)
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+        except (ValueError, TypeError):
+            continue
+    return int(time.time())
 
 
 # ── Monitor loop ────────────────────────────────────────────────────────────
@@ -218,18 +224,16 @@ def monitor(
     db_path: Path,
     gitlab_url: str,
     token: str,
-    project_ids: list[int],
-    group_id: int | None = None,
     poll_delay: float = _POLL_DELAY,
     scan: bool = False,
 ) -> None:
-    """Main monitor loop.
+    """Main monitor loop — polls the global GitLab event stream.
 
     Each cycle:
-      1. Resolve project list (from --project-ids or --group-id).
-      2. For each project, fetch push events and filter to force pushes.
-      3. Deduplicate via the DB (INSERT OR IGNORE).
-      4. Optionally trigger the scanner for new events.
+      1. Fetch one page of push events from ``/api/v4/events?action=pushed``.
+      2. Deduplicate against the *previous* response's IDs (sliding window).
+      3. Filter to zero-commit force pushes & store new events.
+      4. Optionally trigger the scanner for newly-inserted events.
       5. Sleep *poll_delay* seconds, then repeat.
     """
     global _running
@@ -240,75 +244,81 @@ def monitor(
     conn = _init_db(db_path)
     sess = _build_session(token)
 
-    # Resolve projects once at startup; re-resolve each cycle if using a group
-    # so newly-created repos are picked up.
-    static_projects: list[dict] | None = None
-    if project_ids:
-        static_projects = [{"id": pid} for pid in project_ids]
+    # Sliding-window dedup: keep event IDs from the *last* successful
+    # response, matching the GitHub monitor's pattern.
+    latest_ids: list[str] = []
+    latest_key = lambda ev: str(ev.get("id", ""))
 
     log.info(
-        "Monitoring GitLab (%s) — projects=%s, group=%s, poll=%.0fs, scan=%s",
+        "Monitoring GitLab Events API (%s), poll=%.0fs, scan=%s",
         gitlab_url,
-        project_ids or "from group",
-        group_id,
         poll_delay,
         scan,
     )
 
     while _running:
+        sleep_seconds = poll_delay
+
         try:
-            # Determine which projects to poll this cycle
-            if static_projects is not None:
-                projects = static_projects
-            elif group_id is not None:
-                projects = _discover_projects(sess, gitlab_url, group_id)
-                log.info("Discovered %d projects in group %d", len(projects), group_id)
-            else:
-                log.error("No projects or group specified")
-                break
+            events, headers = _fetch_events(sess, gitlab_url)
 
-            cycle_inserted = 0
+            if not events:
+                log.debug("No events returned, sleeping %.1fs", sleep_seconds)
+                time.sleep(sleep_seconds)
+                continue
+
+            # Build full ID list for this response
+            current_ids = [latest_key(e) for e in events]
+
+            # New events = those whose ID was NOT in the previous response
+            new_events = [e for e in events if latest_key(e) not in latest_ids]
+
+            # Slide the window forward
+            latest_ids = current_ids
+
+            # Filter to zero-commit force pushes
+            force_pushes = _extract_force_pushes(new_events)
+
+            inserted = 0
             cycle_force_pushes: list[dict] = []
+            for fp in force_pushes:
+                if _insert_event(conn, fp):
+                    inserted += 1
+                    cycle_force_pushes.append(fp)
+                    log.info(
+                        "New force push: %s/%s  commit=%s",
+                        fp["repo_org"],
+                        fp["repo_name"],
+                        fp["before"],
+                    )
 
-            for proj in projects:
-                if not _running:
-                    break
-
-                pid = proj["id"]
-                # For static IDs we don't have namespace/name; fetch them lazily
-                namespace = proj.get("namespace", {}).get("full_path", "")
-                name = proj.get("path", "")
-                if not namespace or not name:
-                    # Fetch project metadata for static IDs
-                    meta_resp = _gitlab_get(sess, f"{gitlab_url}/api/v4/projects/{pid}")
-                    if meta_resp.status_code == 200:
-                        meta = meta_resp.json()
-                        namespace = meta.get("namespace", {}).get("full_path", str(pid))
-                        name = meta.get("path", str(pid))
-                    else:
-                        namespace = str(pid)
-                        name = str(pid)
-
-                events = _fetch_push_events(sess, gitlab_url, pid)
-                force_pushes = _extract_force_pushes(events, namespace, name)
-
-                for fp in force_pushes:
-                    if _insert_event(conn, fp):
-                        cycle_inserted += 1
-                        cycle_force_pushes.append(fp)
-                        log.info(
-                            "New force push: %s/%s  commit=%s",
-                            fp["repo_org"],
-                            fp["repo_name"],
-                            fp["before"],
-                        )
+            # Log rate-limit info (GitLab uses RateLimit-* headers)
+            remaining = headers.get("RateLimit-Remaining", "?")
+            reset_epoch = headers.get("RateLimit-Reset", "")
+            reset_str = ""
+            if reset_epoch:
+                try:
+                    reset_str = str(
+                        datetime.fromtimestamp(int(reset_epoch), tz=timezone.utc)
+                    )
+                except (ValueError, OSError):
+                    reset_str = reset_epoch
 
             log.info(
-                "Cycle complete: %d projects polled, %d new force pushes stored",
-                len(projects),
-                cycle_inserted,
+                "Found %d new events, %d force pushes (%d stored), "
+                "API remaining: %s, reset: %s, poll: %.0fs",
+                len(new_events),
+                len(force_pushes),
+                inserted,
+                remaining,
+                reset_str,
+                sleep_seconds,
             )
 
+            if len(new_events) >= _PER_PAGE:
+                log.warning("Missed records — new events filled entire page")
+
+            # Optionally trigger scanning for newly-inserted events
             if scan and cycle_force_pushes:
                 _trigger_scan(cycle_force_pushes, gitlab_url)
 
@@ -321,7 +331,7 @@ def monitor(
         except Exception:
             log.exception("Unexpected error during poll cycle")
 
-        time.sleep(poll_delay)
+        time.sleep(sleep_seconds)
 
     conn.close()
     log.info("Monitor stopped.")
@@ -349,25 +359,13 @@ def _trigger_scan(events: list[dict], gitlab_url: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitor GitLab Events API for zero-commit force pushes and "
-        "feed them to the force-push scanner.",
+        description="Monitor the GitLab global event stream for zero-commit "
+        "force pushes and feed them to the force-push scanner.",
     )
     parser.add_argument(
         "--gitlab-url",
         default=os.environ.get("GITLAB_URL", "https://gitlab.com"),
         help="GitLab instance URL (default: $GITLAB_URL or https://gitlab.com)",
-    )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "--project-ids",
-        nargs="+",
-        type=int,
-        help="One or more GitLab project IDs to monitor",
-    )
-    source.add_argument(
-        "--group-id",
-        type=int,
-        help="GitLab group ID — all projects (including subgroups) will be monitored",
     )
     parser.add_argument(
         "--db-file",
@@ -378,7 +376,7 @@ def parse_args() -> argparse.Namespace:
         "--poll-delay",
         type=float,
         default=_POLL_DELAY,
-        help="Seconds between full polling cycles (default: %(default)s)",
+        help="Seconds between polls (default: %(default)s)",
     )
     parser.add_argument(
         "--scan",
@@ -418,8 +416,6 @@ def main() -> None:
         db_path=db_path,
         gitlab_url=args.gitlab_url.rstrip("/"),
         token=token,
-        project_ids=args.project_ids or [],
-        group_id=args.group_id,
         poll_delay=args.poll_delay,
         scan=args.scan,
     )

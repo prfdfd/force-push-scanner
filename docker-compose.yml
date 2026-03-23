@@ -23,8 +23,6 @@ services:
       - --db-file
       - /data/force_push_commits.sqlite3
       - --scan
-      - --group-id
-      - "${GITLAB_GROUP_ID}"
     volumes:
       - fpdata:/data
     logging:
