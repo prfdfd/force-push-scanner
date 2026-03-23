@@ -94,7 +94,7 @@ def scan_with_trufflehog(repo_path: Path, since_commit: str, branch: str) -> Lis
                 findings.append(json.loads(line))
         return findings
     except RunCmdError as err:
-        print(f"[!] trufflehog execution failed: {err} — skipping this repository")
+        print(f"[!] trufflehog execution failed: {_sanitize_url(str(err))} — skipping this repository")
         return []
         
 
@@ -104,6 +104,14 @@ def to_year(date_val) -> str:  # type: ignore[override]
     return _dt.datetime.fromtimestamp(int(date_val), tz=timezone.utc).strftime("%Y")
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+# Strip embedded credentials from URLs before logging/display
+_CRED_RE = re.compile(r"(https?://)([^@]+)@")
+
+
+def _sanitize_url(url: str) -> str:
+    """Remove embedded credentials (``oauth2:token@``) from *url* for safe display."""
+    return _CRED_RE.sub(r"\1", url)
 
 ############################################################
 # Phase 1: Gather data from SQLite3 (default) or user-supplied CSV
@@ -262,6 +270,7 @@ def report(input_org: str, repos: Dict[str, List[dict]]) -> None:
 def _print_formatted_finding(finding: dict, repo_url: str) -> None:
     """Pretty-print a single TruffleHog *finding* for humans. Similar to TruffleHog's CLI output.
     """
+    safe_url = _sanitize_url(repo_url)
     print(f"{Fore.GREEN}")
     print(f"✅ Found verified result 🐷🔑")
     print(f"Detector Type: {finding.get('DetectorName', 'N/A')}")
@@ -270,11 +279,11 @@ def _print_formatted_finding(finding: dict, repo_url: str) -> None:
     raw_val = finding.get('Raw') or finding.get('RawV2', '')
     print(f"Raw result: {Style.RESET_ALL}{raw_val}{Fore.GREEN}")
 
-    print(f"Repository: {repo_url}.git")
+    print(f"Repository: {safe_url}.git")
     print(f"Commit: {finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('commit')}")
     print(f"Email: {finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('email') or 'unknown'}")
     print(f"File: {finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('file')}")
-    print(f"Link: {repo_url}/commit/{finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('commit')}")
+    print(f"Link: {safe_url}/commit/{finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('commit')}")
     print(f"Timestamp: {finding.get('SourceMetadata', {}).get('Data', {}).get('Git', {}).get('timestamp')}")
 
     # Flatten any extra metadata returned by the detector
@@ -321,7 +330,7 @@ def identify_base_commit(repo_path: Path, since_commit:str) -> str:
 
 def scan_commits(repos: Dict[str, List[dict]]) -> None:
     for repo_url, commits in repos.items():
-        print(f"\n[>] Scanning repo: {repo_url}")
+        print(f"\n[>] Scanning repo: {_sanitize_url(repo_url)}")
 
         commit_counter = 0
         skipped_repo = False
@@ -343,7 +352,7 @@ def scan_commits(repos: Dict[str, List[dict]]) -> None:
                     cwd=tmp_path,
                 )
             except RunCmdError as err:
-                print(f"[!] git clone failed: {err} — skipping this repository")
+                print(f"[!] git clone failed: {_sanitize_url(str(err))} — skipping this repository")
                 skipped_repo = True
                 continue
 
@@ -362,7 +371,7 @@ def scan_commits(repos: Dict[str, List[dict]]) -> None:
                     if "fatal: remote error: upload-pack: not our ref" in str(err):
                         print("    This commit was likely manually removed from the repository network  — skipping commit")
                     else:
-                        print(f"    fetch/checkout failed: {err} — skipping commit")
+                        print(f"    fetch/checkout failed: {_sanitize_url(str(err))} — skipping commit")
                     continue
 
                 # Pass in the since_commit and branch values for trufflehog
