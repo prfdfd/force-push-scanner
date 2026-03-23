@@ -9,13 +9,12 @@ Detected events are stored in a SQLite database compatible with
 
 Usage:
     export GITHUB_TOKEN=ghp_...
-    python github_event_monitor.py [--db-file pushes.sqlite3] [--scan] [--interval 1.0]
+    python github_event_monitor.py [--db-file pushes.sqlite3] [--scan] [--poll-delay 0.75]
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -24,18 +23,20 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import requests
 
 log = logging.getLogger("github_event_monitor")
 
-# GitHub Events API returns at most 300 events (10 pages x 30) or 100 per page.
-# We request the maximum per-page to minimise round-trips.
-_PER_PAGE = 100
-_MAX_PAGES = 3  # 300 events per poll cycle is plenty
+# Match the Ruby crawler: single request with a large per_page value.
+# The GitHub Events API caps at 100 per page for the public timeline,
+# but we request as many as it will give us.
+_PAGE_LIMIT = 100
 
-_DEFAULT_INTERVAL = 1.0  # seconds between poll cycles (stay under rate limit)
+# Fixed delay (seconds) between the *end* of one poll and the *start* of the
+# next – mirrors the Ruby crawler's ``EM.add_timer(0.75, &process)`` pattern.
+_POLL_DELAY = 0.75
 _USER_AGENT = "force-push-scanner/1.0"
 
 # ── Database ────────────────────────────────────────────────────────────────
@@ -98,17 +99,16 @@ def _build_session(token: str) -> requests.Session:
     return sess
 
 
-def _fetch_events_page(
+def _fetch_events(
     sess: requests.Session,
-    page: int = 1,
-    per_page: int = _PER_PAGE,
 ) -> tuple[list[dict], dict]:
-    """Fetch a single page from the public events endpoint.
+    """Fetch a single page of events from the public timeline.
 
+    Mirrors the Ruby crawler's single-request approach with a large per_page.
     Returns (events_list, response_headers).
     """
-    url = f"https://api.github.com/events?per_page={per_page}&page={page}"
-    resp = sess.get(url, timeout=10)
+    url = f"https://api.github.com/events?per_page={_PAGE_LIMIT}"
+    resp = sess.get(url, timeout=(5, 5))  # (connect_timeout, read_timeout)
     resp.raise_for_status()
     return resp.json(), dict(resp.headers)
 
@@ -186,11 +186,23 @@ def _handle_signal(signum, frame):
 def monitor(
     db_path: Path,
     token: str,
-    interval: float = _DEFAULT_INTERVAL,
+    poll_delay: float = _POLL_DELAY,
     scan: bool = False,
     verbose: bool = False,
 ) -> None:
-    """Main monitor loop: poll → filter → store → (optionally) scan."""
+    """Main monitor loop – mirrors the Ruby crawler's callback/timer pattern.
+
+    Each cycle:
+      1. Fetch one page of events from the public timeline.
+      2. Deduplicate against the *previous* response's IDs (sliding window).
+      3. Filter & store new force-push events.
+      4. Log rate-limit headers (Remaining / Reset).
+      5. Sleep ``poll_delay`` seconds, then repeat.
+
+    On any error (HTTP or network) the same delay is applied before retrying,
+    exactly like the Ruby crawler's ``EM.add_timer(0.75, &process)`` in the
+    errback.
+    """
     global _running
 
     signal.signal(signal.SIGINT, _handle_signal)
@@ -199,35 +211,36 @@ def monitor(
     conn = _init_db(db_path)
     sess = _build_session(token)
 
-    # Track event IDs we've already seen this session to skip duplicates
-    # quickly without hitting the DB every time.
-    seen_ids: Set[str] = set()
+    # Sliding-window dedup: keep only the event IDs from the *last* successful
+    # response, just like the Ruby crawler's ``@latest = urls``.
+    latest_ids: list[str] = []
+    latest_key = lambda ev: ev.get("id", "")
 
     log.info(
-        "Monitoring GitHub Events API (interval=%.1fs, db=%s, scan=%s)",
-        interval,
+        "Monitoring GitHub Events API (poll_delay=%.2fs, db=%s, scan=%s)",
+        poll_delay,
         db_path,
         scan,
     )
 
     while _running:
         try:
-            all_events: list[dict] = []
-            for page in range(1, _MAX_PAGES + 1):
-                events, headers = _fetch_events_page(sess, page=page)
-                all_events.extend(events)
-                # Stop paging if fewer results than requested (last page)
-                if len(events) < _PER_PAGE:
-                    break
+            events, headers = _fetch_events(sess)
 
-            force_pushes = _extract_force_pushes(all_events)
+            # Build the full ID list for this response
+            current_ids = [latest_key(e) for e in events]
 
-            # Deduplicate against session cache
-            new_pushes = [fp for fp in force_pushes if fp["id"] not in seen_ids]
+            # New events = those whose ID was NOT in the previous response
+            new_events = [e for e in events if latest_key(e) not in latest_ids]
+
+            # Slide the window forward (replace, don't accumulate)
+            latest_ids = current_ids
+
+            # Filter to zero-commit force pushes
+            force_pushes = _extract_force_pushes(new_events)
 
             inserted = 0
-            for fp in new_pushes:
-                seen_ids.add(fp["id"])
+            for fp in force_pushes:
                 if _insert_event(conn, fp):
                     inserted += 1
                     log.info(
@@ -237,59 +250,46 @@ def monitor(
                         fp["before"],
                     )
 
-            # Rate-limit info
+            # Log rate-limit info (read & log, same as the Ruby crawler)
             remaining = headers.get("X-RateLimit-Remaining", "?")
-            reset_ts = headers.get("X-RateLimit-Reset", "")
+            reset_epoch = headers.get("X-RateLimit-Reset", "")
             reset_str = ""
-            if reset_ts:
+            if reset_epoch:
                 try:
-                    reset_str = datetime.fromtimestamp(
-                        int(reset_ts), tz=timezone.utc
-                    ).strftime("%H:%M:%S UTC")
+                    reset_str = str(
+                        datetime.fromtimestamp(int(reset_epoch), tz=timezone.utc)
+                    )
                 except (ValueError, OSError):
-                    reset_str = reset_ts
+                    reset_str = reset_epoch
 
             log.info(
-                "Polled %d events, %d force pushes (%d new) | API remaining: %s (reset %s)",
-                len(all_events),
+                "Found %d new events, %d force pushes (%d stored), API: %s, reset: %s",
+                len(new_events),
                 len(force_pushes),
                 inserted,
                 remaining,
                 reset_str,
             )
 
-            # Optionally trigger scanning for each newly-inserted event
-            if scan and inserted > 0:
-                _trigger_scan(db_path, new_pushes)
+            if len(new_events) >= _PAGE_LIMIT:
+                log.warning("Missed records — new events filled entire page")
 
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "?"
-            if status == 403:
-                # Rate limited – back off until reset
-                reset_ts = ""
-                if exc.response is not None:
-                    reset_ts = exc.response.headers.get("X-RateLimit-Reset", "")
-                wait = 60
-                if reset_ts:
-                    try:
-                        wait = max(
-                            1,
-                            int(reset_ts) - int(time.time()) + 1,
-                        )
-                    except ValueError:
-                        pass
-                log.warning("Rate limited (403). Sleeping %ds until reset.", wait)
-                time.sleep(wait)
-                continue
-            else:
-                log.error("HTTP error %s: %s", status, exc)
+            # Optionally trigger scanning for newly-inserted events
+            if scan and inserted > 0:
+                _trigger_scan(db_path, force_pushes)
+
         except requests.exceptions.RequestException as exc:
-            log.error("Request failed: %s", exc)
+            log.error(
+                "Error: status=%s, response=%s",
+                getattr(getattr(exc, "response", None), "status_code", "?"),
+                getattr(getattr(exc, "response", None), "text", str(exc)),
+            )
         except Exception:
             log.exception("Unexpected error during poll cycle")
 
-        # Wait before next cycle
-        time.sleep(interval)
+        # Fixed delay after completion (success or failure), matching the
+        # Ruby crawler's EM.add_timer(0.75, &process) in both callback paths.
+        time.sleep(poll_delay)
 
     conn.close()
     log.info("Monitor stopped.")
@@ -332,10 +332,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to the SQLite database for storing events (default: force_push_commits.sqlite3)",
     )
     parser.add_argument(
-        "--interval",
+        "--poll-delay",
         type=float,
-        default=_DEFAULT_INTERVAL,
-        help="Seconds between poll cycles (default: %(default)s)",
+        default=_POLL_DELAY,
+        help="Seconds to wait after each poll before the next one (default: %(default)s)",
     )
     parser.add_argument(
         "--scan",
@@ -368,7 +368,7 @@ def main() -> None:
     monitor(
         db_path=db_path,
         token=token,
-        interval=args.interval,
+        poll_delay=args.poll_delay,
         scan=args.scan,
         verbose=args.verbose,
     )
