@@ -391,9 +391,8 @@ def scan_commits(repo_user: str, repos: Dict[str, List[dict]]) -> None:
 ############################################################
 # Entry point
 ############################################################
-def main(args: argparse.Namespace | None = None) -> None:
-    if args is None:
-        args = parse_args()
+def main() -> None:
+    args = parse_args()
 
     # Configure logging
     logging.basicConfig(
@@ -445,10 +444,8 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    # git is always required; trufflehog is only needed when --scan is used.
-    if shutil.which("git") is None:
-        terminate("Required tool 'git' not found in PATH")
-    args = parse_args()
-    if args.scan and shutil.which("trufflehog") is None:
-        terminate("Required tool 'trufflehog' not found in PATH (needed for --scan)")
-    main(args)
+    # Ensure required external tools are available early.
+    for tool in ("git", "trufflehog"):
+        if shutil.which(tool) is None:
+            terminate(f"Required tool '{tool}' not found in PATH")
+    main()

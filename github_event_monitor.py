@@ -276,7 +276,7 @@ def monitor(
 
             # Optionally trigger scanning for newly-inserted events
             if scan and inserted > 0:
-                _trigger_scan(db_path, force_pushes)
+                _trigger_scan(force_pushes)
 
         except requests.exceptions.RequestException as exc:
             log.error(
@@ -295,27 +295,27 @@ def monitor(
     log.info("Monitor stopped.")
 
 
-def _trigger_scan(db_path: Path, events: list[dict]) -> None:
-    """Invoke force_push_scanner for each unique org in the new events."""
-    import subprocess
+def _trigger_scan(events: list[dict]) -> None:
+    """Scan all newly-detected force push events directly.
 
-    orgs = {e["repo_org"] for e in events}
-    for org in orgs:
-        log.info("Triggering scan for org: %s", org)
-        try:
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).parent / "force_push_scanner.py"),
-                    org,
-                    "--db-file",
-                    str(db_path),
-                    "--scan",
-                ],
-                check=False,
-            )
-        except Exception:
-            log.exception("Failed to launch scanner for org %s", org)
+    Builds the repos mapping from the new events and calls
+    ``force_push_scanner.scan_commits`` without filtering by org —
+    every new event gets scanned.
+    """
+    from collections import defaultdict
+    from force_push_scanner import scan_commits
+
+    # Build the same {repo_url → [{before, date}]} structure the scanner expects
+    repos: dict[str, list[dict]] = defaultdict(list)
+    for ev in events:
+        url = f"https://github.com/{ev['repo_org']}/{ev['repo_name']}"
+        repos[url].append({"before": ev["before"], "date": ev["timestamp"]})
+
+    log.info("Scanning %d events across %d repos", len(events), len(repos))
+    try:
+        scan_commits("", repos)
+    except Exception:
+        log.exception("Scan failed")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
