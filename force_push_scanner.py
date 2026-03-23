@@ -74,20 +74,20 @@ def run(cmd: List[str], cwd: Path | None = None) -> str:
 def scan_with_trufflehog(repo_path: Path, since_commit: str, branch: str) -> List[dict]:
     """Run trufflehog in git mode, returning the parsed JSON findings."""
     try:
-        stdout = run(
-            [
-                "trufflehog",
-                "git",
-                "--branch",
-                branch,
-                "--since-commit",
-                since_commit,
-                "--no-update",
-                "--json",
-                "--only-verified",
-                "file://" + str(repo_path.absolute()),
-            ],
-        )
+        cmd = [
+            "trufflehog",
+            "git",
+            "--branch",
+            branch,
+            "--no-update",
+            "--json",
+            "--only-verified",
+        ]
+        if since_commit:
+            cmd += ["--since-commit", since_commit]
+        cmd.append("file://" + str(repo_path.absolute()))
+
+        stdout = run(cmd)
         findings: List[dict] = []
         for line in stdout.splitlines():
             with suppress(json.JSONDecodeError):
@@ -319,7 +319,7 @@ def identify_base_commit(repo_path: Path, since_commit:str) -> str:
     return ""
 
 
-def scan_commits(repo_user: str, repos: Dict[str, List[dict]]) -> None:
+def scan_commits(repos: Dict[str, List[dict]]) -> None:
     for repo_url, commits in repos.items():
         print(f"\n[>] Scanning repo: {repo_url}")
 
@@ -407,7 +407,7 @@ def main() -> None:
     report(args.input_org, repos)
     
     if args.scan:
-        scan_commits(args.input_org, repos)
+        scan_commits(repos)
     else:
         print("[✓] Exiting without scan.")
 

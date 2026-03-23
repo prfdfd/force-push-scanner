@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import shutil
+
 import requests
 
 log = logging.getLogger("github_event_monitor")
@@ -353,7 +355,7 @@ def _trigger_scan(events: list[dict]) -> None:
 
     log.info("Scanning %d events across %d repos", len(events), len(repos))
     try:
-        scan_commits("", repos)
+        scan_commits(repos)
     except Exception:
         log.exception("Scan failed")
 
@@ -403,6 +405,13 @@ def main() -> None:
     if not token:
         log.error("GITHUB_TOKEN environment variable is required.")
         sys.exit(1)
+
+    # Fail fast if --scan is requested but required tools are missing
+    if args.scan:
+        for tool in ("git", "trufflehog"):
+            if shutil.which(tool) is None:
+                log.error("Required tool '%s' not found in PATH (needed for --scan)", tool)
+                sys.exit(1)
 
     db_path = Path(args.db_file)
     monitor(
