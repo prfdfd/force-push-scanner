@@ -37,6 +37,24 @@ Export the results as a CSV, then run the scanner:
 python force_push_scanner.py <org> --events-file /path/to/force_push_commits.csv --scan
 ```
 
+### Live Monitoring: GitHub Events API
+
+Instead of relying on archived data, you can monitor the GitHub Events API in real time to detect force pushes as they happen:
+
+```bash
+export GITHUB_TOKEN=ghp_...
+python github_event_monitor.py --db-file force_push_commits.sqlite3
+```
+
+The monitor polls the public GitHub Events API, filters for zero-commit force push events, and stores them in the same SQLite database format used by the scanner. You can then scan detected events on-the-fly:
+
+```bash
+# Monitor and automatically scan new force pushes as they're detected
+python github_event_monitor.py --db-file force_push_commits.sqlite3 --scan
+```
+
+Run `python github_event_monitor.py -h` for all options (`--interval`, `--verbose`, etc.).
+
 ---
 
 ## What the script does
