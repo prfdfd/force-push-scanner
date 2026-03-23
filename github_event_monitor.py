@@ -4,6 +4,10 @@ Polls the public GitHub Events API for PushEvent entries that indicate
 force pushes (especially zero-commit force pushes, which strongly correlate
 with developers trying to remove accidentally-committed secrets).
 
+Uses **conditional requests** (ETag / ``If-None-Match``) so that unchanged
+responses return 304 Not Modified at zero rate-limit cost, and respects the
+``X-Poll-Interval`` header to avoid being throttled.
+
 Detected events are stored in a SQLite database compatible with
 ``force_push_scanner.py --db-file``.
 
@@ -101,16 +105,31 @@ def _build_session(token: str) -> requests.Session:
 
 def _fetch_events(
     sess: requests.Session,
-) -> tuple[list[dict], dict]:
+    etag: str = "",
+) -> tuple[list[dict], dict, str]:
     """Fetch a single page of events from the public timeline.
 
-    Mirrors the Ruby crawler's single-request approach with a large per_page.
-    Returns (events_list, response_headers).
+    Uses conditional requests (``If-None-Match`` / ETag) so that unchanged
+    responses return ``304 Not Modified`` which costs **zero** against the
+    GitHub rate limit.
+
+    Returns ``(events_list, response_headers, new_etag)``.
+    When a 304 is received the events list is empty and the ETag is unchanged.
     """
     url = f"https://api.github.com/events?per_page={_PAGE_LIMIT}"
-    resp = sess.get(url, timeout=(5, 5))  # (connect_timeout, read_timeout)
+    headers: dict[str, str] = {}
+    if etag:
+        headers["If-None-Match"] = etag
+
+    resp = sess.get(url, timeout=(5, 5), headers=headers)
+
+    if resp.status_code == 304:
+        # Data unchanged – free request, no new events to process
+        return [], dict(resp.headers), etag
+
     resp.raise_for_status()
-    return resp.json(), dict(resp.headers)
+    new_etag = resp.headers.get("ETag", "")
+    return resp.json(), dict(resp.headers), new_etag
 
 
 def _extract_force_pushes(events: list[dict]) -> list[dict]:
@@ -190,18 +209,18 @@ def monitor(
     scan: bool = False,
     verbose: bool = False,
 ) -> None:
-    """Main monitor loop – mirrors the Ruby crawler's callback/timer pattern.
+    """Main monitor loop with ETag conditional requests.
 
     Each cycle:
-      1. Fetch one page of events from the public timeline.
+      1. Fetch one page of events using conditional requests (ETag).
+         A 304 Not Modified costs zero against the rate limit.
       2. Deduplicate against the *previous* response's IDs (sliding window).
       3. Filter & store new force-push events.
       4. Log rate-limit headers (Remaining / Reset).
-      5. Sleep ``poll_delay`` seconds, then repeat.
-
-    On any error (HTTP or network) the same delay is applied before retrying,
-    exactly like the Ruby crawler's ``EM.add_timer(0.75, &process)`` in the
-    errback.
+      5. Respect the ``X-Poll-Interval`` header from the Events API (minimum
+         seconds between polls, typically 60s).  Falls back to *poll_delay*
+         if the header is absent.
+      6. Repeat.
     """
     global _running
 
@@ -216,6 +235,9 @@ def monitor(
     latest_ids: list[str] = []
     latest_key = lambda ev: ev.get("id", "")
 
+    # ETag for conditional requests — starts empty (first request is unconditional)
+    etag: str = ""
+
     log.info(
         "Monitoring GitHub Events API (poll_delay=%.2fs, db=%s, scan=%s)",
         poll_delay,
@@ -224,8 +246,27 @@ def monitor(
     )
 
     while _running:
+        # Default sleep; may be overridden by X-Poll-Interval below
+        sleep_seconds = poll_delay
+
         try:
-            events, headers = _fetch_events(sess)
+            events, headers, etag = _fetch_events(sess, etag=etag)
+
+            # Respect X-Poll-Interval from the Events API (usually 60s).
+            # This is the *minimum* wait the server requires between polls.
+            x_poll = headers.get("X-Poll-Interval")
+            if x_poll:
+                try:
+                    server_interval = float(x_poll)
+                    sleep_seconds = max(sleep_seconds, server_interval)
+                except (ValueError, TypeError):
+                    pass
+
+            if not events:
+                # 304 Not Modified — no new data, nothing to process
+                log.debug("304 Not Modified (rate-limit free), sleeping %.1fs", sleep_seconds)
+                time.sleep(sleep_seconds)
+                continue
 
             # Build the full ID list for this response
             current_ids = [latest_key(e) for e in events]
@@ -250,7 +291,7 @@ def monitor(
                         fp["before"],
                     )
 
-            # Log rate-limit info (read & log, same as the Ruby crawler)
+            # Log rate-limit info
             remaining = headers.get("X-RateLimit-Remaining", "?")
             reset_epoch = headers.get("X-RateLimit-Reset", "")
             reset_str = ""
@@ -263,12 +304,13 @@ def monitor(
                     reset_str = reset_epoch
 
             log.info(
-                "Found %d new events, %d force pushes (%d stored), API: %s, reset: %s",
+                "Found %d new events, %d force pushes (%d stored), API: %s, reset: %s, poll: %.0fs",
                 len(new_events),
                 len(force_pushes),
                 inserted,
                 remaining,
                 reset_str,
+                sleep_seconds,
             )
 
             if len(new_events) >= _PAGE_LIMIT:
@@ -287,9 +329,7 @@ def monitor(
         except Exception:
             log.exception("Unexpected error during poll cycle")
 
-        # Fixed delay after completion (success or failure), matching the
-        # Ruby crawler's EM.add_timer(0.75, &process) in both callback paths.
-        time.sleep(poll_delay)
+        time.sleep(sleep_seconds)
 
     conn.close()
     log.info("Monitor stopped.")
