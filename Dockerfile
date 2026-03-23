@@ -17,4 +17,4 @@ COPY force_push_scanner.py github_event_monitor.py gitlab_event_monitor.py ./
 # SQLite DB lives here — mount a volume to persist across restarts
 VOLUME ["/data"]
 
-ENTRYPOINT ["python", "github_event_monitor.py", "--db-file", "/data/force_push_commits.sqlite3", "--scan"]
+ENTRYPOINT ["python", "github_event_monitor.py", "--db-file", "/data/force_push_commits.sqlite3"]

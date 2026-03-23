@@ -232,6 +232,10 @@ def monitor(
     conn = _init_db(db_path)
     sess = _build_session(token)
 
+    # Prune old events at startup to keep DB size bounded
+    from force_push_scanner import prune_old_events
+    prune_old_events(conn)
+
     # Sliding-window dedup: keep only the event IDs from the *last* successful
     # response, just like the Ruby crawler's ``@latest = urls``.
     latest_ids: list[str] = []
@@ -318,9 +322,9 @@ def monitor(
             if len(new_events) >= _PAGE_LIMIT:
                 log.warning("Missed records — new events filled entire page")
 
-            # Optionally trigger scanning for newly-inserted events
+            # Trigger scanning for newly-inserted events
             if scan and inserted > 0:
-                _trigger_scan(force_pushes)
+                _trigger_scan(force_pushes, db_path)
 
         except requests.exceptions.RequestException as exc:
             log.error(
@@ -337,12 +341,12 @@ def monitor(
     log.info("Monitor stopped.")
 
 
-def _trigger_scan(events: list[dict]) -> None:
+def _trigger_scan(events: list[dict], db_path: Path) -> None:
     """Scan all newly-detected force push events directly.
 
     Builds the repos mapping from the new events and calls
     ``force_push_scanner.scan_commits`` without filtering by org —
-    every new event gets scanned.
+    every new event gets scanned.  Findings are persisted to *db_path*.
     """
     from collections import defaultdict
     from force_push_scanner import scan_commits
@@ -355,7 +359,7 @@ def _trigger_scan(events: list[dict]) -> None:
 
     log.info("Scanning %d events across %d repos", len(events), len(repos))
     try:
-        scan_commits(repos)
+        scan_commits(repos, db_path=db_path)
     except Exception:
         log.exception("Scan failed")
 
@@ -380,9 +384,9 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait after each poll before the next one (default: %(default)s)",
     )
     parser.add_argument(
-        "--scan",
+        "--no-scan",
         action="store_true",
-        help="Automatically run the force-push scanner when new events are detected",
+        help="Disable automatic scanning — only collect events, do not run trufflehog",
     )
     parser.add_argument(
         "--verbose",
@@ -406,11 +410,13 @@ def main() -> None:
         log.error("GITHUB_TOKEN environment variable is required.")
         sys.exit(1)
 
-    # Fail fast if --scan is requested but required tools are missing
-    if args.scan:
+    scan = not args.no_scan
+
+    # Fail fast if scanning but required tools are missing
+    if scan:
         for tool in ("git", "trufflehog"):
             if shutil.which(tool) is None:
-                log.error("Required tool '%s' not found in PATH (needed for --scan)", tool)
+                log.error("Required tool '%s' not found in PATH", tool)
                 sys.exit(1)
 
     db_path = Path(args.db_file)
@@ -418,7 +424,7 @@ def main() -> None:
         db_path=db_path,
         token=token,
         poll_delay=args.poll_delay,
-        scan=args.scan,
+        scan=scan,
         verbose=args.verbose,
     )
 

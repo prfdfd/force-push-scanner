@@ -22,7 +22,6 @@ services:
       - gitlab_event_monitor.py
       - --db-file
       - /data/force_push_commits.sqlite3
-      - --scan
     volumes:
       - fpdata:/data
     logging:

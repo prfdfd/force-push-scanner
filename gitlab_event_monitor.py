@@ -244,6 +244,10 @@ def monitor(
     conn = _init_db(db_path)
     sess = _build_session(token)
 
+    # Prune old events at startup to keep DB size bounded
+    from force_push_scanner import prune_old_events
+    prune_old_events(conn)
+
     # Sliding-window dedup: keep event IDs from the *last* successful
     # response, matching the GitHub monitor's pattern.
     latest_ids: list[str] = []
@@ -320,7 +324,7 @@ def monitor(
 
             # Optionally trigger scanning for newly-inserted events
             if scan and cycle_force_pushes:
-                _trigger_scan(cycle_force_pushes, gitlab_url)
+                _trigger_scan(cycle_force_pushes, gitlab_url, db_path)
 
         except requests.exceptions.RequestException as exc:
             log.error(
@@ -337,7 +341,7 @@ def monitor(
     log.info("Monitor stopped.")
 
 
-def _trigger_scan(events: list[dict], gitlab_url: str) -> None:
+def _trigger_scan(events: list[dict], gitlab_url: str, db_path: Path) -> None:
     """Scan newly-detected force push events via force_push_scanner."""
     from collections import defaultdict
     from force_push_scanner import scan_commits
@@ -349,7 +353,7 @@ def _trigger_scan(events: list[dict], gitlab_url: str) -> None:
 
     log.info("Scanning %d events across %d repos", len(events), len(repos))
     try:
-        scan_commits(repos)
+        scan_commits(repos, db_path=db_path)
     except Exception:
         log.exception("Scan failed")
 
@@ -379,9 +383,9 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between polls (default: %(default)s)",
     )
     parser.add_argument(
-        "--scan",
+        "--no-scan",
         action="store_true",
-        help="Automatically run the force-push scanner when new events are detected",
+        help="Disable automatic scanning — only collect events, do not run trufflehog",
     )
     parser.add_argument(
         "--verbose",
@@ -405,10 +409,12 @@ def main() -> None:
         log.error("GITLAB_TOKEN environment variable is required.")
         sys.exit(1)
 
-    if args.scan:
+    scan = not args.no_scan
+
+    if scan:
         for tool in ("git", "trufflehog"):
             if shutil.which(tool) is None:
-                log.error("Required tool '%s' not found in PATH (needed for --scan)", tool)
+                log.error("Required tool '%s' not found in PATH", tool)
                 sys.exit(1)
 
     db_path = Path(args.db_file)
@@ -417,7 +423,7 @@ def main() -> None:
         gitlab_url=args.gitlab_url.rstrip("/"),
         token=token,
         poll_delay=args.poll_delay,
-        scan=args.scan,
+        scan=scan,
     )
 
 

@@ -259,6 +259,65 @@ def report(input_org: str, repos: Dict[str, List[dict]]) -> None:
 # Phase 3: Secret scanning
 ############################################################
 
+# Default retention: 90 days for processed push events
+_RETENTION_DAYS = 90
+
+
+def init_findings_db(db_path: Path) -> sqlite3.Connection:
+    """Open the DB and ensure the findings table exists alongside pushes."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS findings (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_url        TEXT NOT NULL,
+            commit_sha      TEXT,
+            detector        TEXT,
+            decoder         TEXT,
+            file            TEXT,
+            email           TEXT,
+            raw             TEXT,
+            extra_json      TEXT,
+            found_at        INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _store_finding(conn: sqlite3.Connection, finding: dict, repo_url: str) -> None:
+    """Persist a single trufflehog finding to the database."""
+    git_meta = finding.get("SourceMetadata", {}).get("Data", {}).get("Git", {})
+    extra = finding.get("ExtraData") or {}
+    conn.execute(
+        "INSERT INTO findings "
+        "(repo_url, commit_sha, detector, decoder, file, email, raw, extra_json, found_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            repo_url,
+            git_meta.get("commit"),
+            finding.get("DetectorName"),
+            finding.get("DecoderName"),
+            git_meta.get("file"),
+            git_meta.get("email"),
+            finding.get("Raw") or finding.get("RawV2", ""),
+            json.dumps(extra) if extra else None,
+            int(_dt.datetime.now(tz=timezone.utc).timestamp()),
+        ),
+    )
+    conn.commit()
+
+
+def prune_old_events(conn: sqlite3.Connection, retention_days: int = _RETENTION_DAYS) -> int:
+    """Delete push events older than *retention_days*. Returns rows deleted."""
+    cutoff = int((_dt.datetime.now(tz=timezone.utc) - _dt.timedelta(days=retention_days)).timestamp())
+    cur = conn.execute("DELETE FROM pushes WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    deleted = cur.rowcount
+    if deleted:
+        logging.info("Pruned %d push events older than %d days", deleted, retention_days)
+    return deleted
+
+
 def _print_formatted_finding(finding: dict, repo_url: str) -> None:
     """Pretty-print a single TruffleHog *finding* for humans. Similar to TruffleHog's CLI output.
     """
@@ -319,73 +378,79 @@ def identify_base_commit(repo_path: Path, since_commit:str) -> str:
     return ""
 
 
-def scan_commits(repos: Dict[str, List[dict]]) -> None:
-    for repo_url, commits in repos.items():
-        print(f"\n[>] Scanning repo: {repo_url}")
+def scan_commits(repos: Dict[str, List[dict]], db_path: Path | None = None) -> None:
+    findings_conn: sqlite3.Connection | None = None
+    if db_path:
+        findings_conn = init_findings_db(db_path)
 
-        commit_counter = 0
-        skipped_repo = False
+    try:
+        for repo_url, commits in repos.items():
+            print(f"\n[>] Scanning repo: {repo_url}")
 
-        tmp_dir = tempfile.mkdtemp(prefix="gh-repo-")
-        try:
-            tmp_path = Path(tmp_dir)
+            commit_counter = 0
+            skipped_repo = False
+
+            tmp_dir = tempfile.mkdtemp(prefix="gh-repo-")
             try:
-                # Partial clone with no blobs to save space and for speed
-                run(
-                    [
-                        "git",
-                        "clone",
-                        "--filter=blob:none",
-                        "--no-checkout",
-                        repo_url + ".git",
-                        ".",
-                    ],
-                    cwd=tmp_path,
-                )
-            except RunCmdError as err:
-                print(f"[!] git clone failed: {err} — skipping this repository")
-                skipped_repo = True
-                continue
-
-            for c in commits:
-                before = c["before"]
-                if not _SHA_RE.fullmatch(before):
-                    print(f"  • Commit {before} – invalid SHA, skipping")
-                    continue
-                commit_counter += 1
-                print(f"  • Commit {before}")
+                tmp_path = Path(tmp_dir)
                 try:
-                    since_commit = identify_base_commit(tmp_path, before)
+                    # Partial clone with no blobs to save space and for speed
+                    run(
+                        [
+                            "git",
+                            "clone",
+                            "--filter=blob:none",
+                            "--no-checkout",
+                            repo_url + ".git",
+                            ".",
+                        ],
+                        cwd=tmp_path,
+                    )
                 except RunCmdError as err:
-                    # If the commit was logged in GH Archive, but not longer exists in the repo network, then it was likely manually removed it.
-                    # For more details, see: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository#:~:text=You%20cannot%20remove,rotating%20affected%20credentials.
-                    if "fatal: remote error: upload-pack: not our ref" in str(err):
-                        print("    This commit was likely manually removed from the repository network  — skipping commit")
-                    else:
-                        print(f"    fetch/checkout failed: {err} — skipping commit")
+                    print(f"[!] git clone failed: {err} — skipping this repository")
+                    skipped_repo = True
                     continue
 
-                # Pass in the since_commit and branch values for trufflehog
-                findings = scan_with_trufflehog(tmp_path, since_commit=since_commit, branch=before)
-                
-                if findings:
+                for c in commits:
+                    before = c["before"]
+                    if not _SHA_RE.fullmatch(before):
+                        print(f"  • Commit {before} – invalid SHA, skipping")
+                        continue
+                    commit_counter += 1
+                    print(f"  • Commit {before}")
+                    try:
+                        since_commit = identify_base_commit(tmp_path, before)
+                    except RunCmdError as err:
+                        # If the commit was logged in GH Archive, but not longer exists in the repo network, then it was likely manually removed it.
+                        # For more details, see: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository#:~:text=You%20cannot%20remove,rotating%20affected%20credentials.
+                        if "fatal: remote error: upload-pack: not our ref" in str(err):
+                            print("    This commit was likely manually removed from the repository network  — skipping commit")
+                        else:
+                            print(f"    fetch/checkout failed: {err} — skipping commit")
+                        continue
+
+                    # Pass in the since_commit and branch values for trufflehog
+                    findings = scan_with_trufflehog(tmp_path, since_commit=since_commit, branch=before)
+
                     for f in findings:
                         _print_formatted_finding(f, repo_url)
-                else:
-                    pass
+                        if findings_conn:
+                            _store_finding(findings_conn, f, repo_url)
 
-        finally:
-            # Attempt cleanup but suppress ENOTEMPTY race-condition errors
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except OSError:
-                print(f"    Error cleaning up temporary directory: {tmp_dir}")
-                pass
+            finally:
+                # Attempt cleanup but suppress ENOTEMPTY race-condition errors
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except OSError:
+                    print(f"    Error cleaning up temporary directory: {tmp_dir}")
 
-        if skipped_repo:
-            print("[!] Repo skipped due to earlier errors")
-        else:
-            print(f"[✓] {commit_counter} commits scanned.")
+            if skipped_repo:
+                print("[!] Repo skipped due to earlier errors")
+            else:
+                print(f"[✓] {commit_counter} commits scanned.")
+    finally:
+        if findings_conn:
+            findings_conn.close()
 
 
 ############################################################
@@ -406,10 +471,10 @@ def main() -> None:
     repos = gather_commits(args.input_org, events_path, db_path)
     report(args.input_org, repos)
     
-    if args.scan:
-        scan_commits(repos)
-    else:
+    if args.no_scan:
         print("[✓] Exiting without scan.")
+    else:
+        scan_commits(repos, db_path=db_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -422,9 +487,9 @@ def parse_args() -> argparse.Namespace:
         help="GitHub username or organization to inspect",
     )
     parser.add_argument(
-        "--scan",
+        "--no-scan",
         action="store_true",
-        help="Run a trufflehog scan on every force-pushed commit",
+        help="Skip the trufflehog scan and only print the report",
     )
     parser.add_argument(
         "--verbose",
