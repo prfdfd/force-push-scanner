@@ -101,6 +101,9 @@ def _build_session(token: str) -> requests.Session:
     return sess
 
 
+_MAX_429_RETRIES = 5
+
+
 def _gitlab_get(
     sess: requests.Session, url: str, params: dict | None = None,
 ) -> requests.Response:
@@ -110,12 +113,19 @@ def _gitlab_get(
     files > 10 MB on ``/repository/blobs`` and ``/repository/files``
     endpoints).  Those endpoints return 429 with ``Retry-After`` as well,
     so the same handler covers both.
+
+    Retries up to ``_MAX_429_RETRIES`` times before raising.
     """
+    retries = 0
     while True:
         resp = sess.get(url, params=params, timeout=(10, 30))
         if resp.status_code == 429:
+            retries += 1
+            if retries > _MAX_429_RETRIES:
+                log.error("Rate limit exceeded after %d retries, giving up", _MAX_429_RETRIES)
+                resp.raise_for_status()
             sleep_time = int(resp.headers.get("Retry-After", 60))
-            log.warning("Rate limit hit. Sleeping for %d seconds...", sleep_time)
+            log.warning("Rate limit hit (%d/%d). Sleeping for %d seconds...", retries, _MAX_429_RETRIES, sleep_time)
             time.sleep(sleep_time)
             continue
         return resp

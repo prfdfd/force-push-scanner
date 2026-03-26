@@ -9,7 +9,7 @@ import subprocess
 import datetime as _dt
 from collections import defaultdict, Counter
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 # Stdlib additions
 import argparse
@@ -99,7 +99,7 @@ def scan_with_trufflehog(repo_path: Path, since_commit: str, branch: str) -> Lis
         
 
 # Utility: extract year from Unix epoch INT.
-def to_year(date_val) -> str:  # type: ignore[override]
+def to_year(date_val) -> str:
     """Return the four-digit year (YYYY) from *date_val* which can be an int (epoch)"""
     return _dt.datetime.fromtimestamp(int(date_val), tz=timezone.utc).strftime("%Y")
 
@@ -154,6 +154,7 @@ def _gather_from_iter(input_org: str, rows: List[dict]) -> Dict[str, List[dict]]
             repo_org, repo_name, before, ts_int = _validate_row(input_org, row, idx)
         except ValueError as ve:
             terminate(str(ve))
+            return repos  # unreachable, but satisfies type checkers
 
         url = f"https://github.com/{repo_org}/{repo_name}"
         repos[url].append({"before": before, "date": ts_int})
@@ -164,8 +165,8 @@ def _gather_from_iter(input_org: str, rows: List[dict]) -> Dict[str, List[dict]]
 
 def gather_commits(
     input_org: str,
-    events_file: Optional[Path] | None = None,
-    db_file: Optional[Path] | None = None,
+    events_file: Path | None = None,
+    db_file: Path | None = None,
 ) -> Dict[str, List[dict]]:
     """Return mapping of repo URL → list[{before, pushed_at}].
 
@@ -354,16 +355,16 @@ def identify_base_commit(repo_path: Path, since_commit:str) -> str:
     # working backwards from the since_commit, we need to find the first commit that exists in any branch
     for commit in output.splitlines():
         #remove the newline character
-        commit = commit.strip('\n')
+        commit = commit.strip()
         # Check if commit exists in any branch, if it does, we've found the base commit
-        if run(["git", "branch", "--contains", commit, "--all"], cwd=repo_path):
+        if run(["git", "branch", "--contains", commit, "--all"], cwd=repo_path).strip():
             if commit != since_commit:
                 return commit
             try:
                 # if the commit is the same as the since_commit, we need to go back one commit to scan this commit
                 # if there is no commit~1, then since_commit is the base commit and we need "" for trufflehog
                 c = run(["git", "rev-list", commit + "~1", "-n", "1"], cwd=repo_path)
-                return c.strip('\n')
+                return c.strip()
             except RunCmdError as err: # need to handle 128 git errors
                 return ""
         continue
@@ -374,7 +375,7 @@ def identify_base_commit(repo_path: Path, since_commit:str) -> str:
     #       not covered by "" in the future.
     #       c = run(["git", "rev-list", "--max-parents=0", 
     #           since_commit, "-n", "1"], cwd=repo_path)
-    #       return c.strip('\n')
+    #       return c.strip()
     return ""
 
 
@@ -388,7 +389,6 @@ def scan_commits(repos: Dict[str, List[dict]], db_path: Path | None = None) -> N
             print(f"\n[>] Scanning repo: {repo_url}")
 
             commit_counter = 0
-            skipped_repo = False
 
             tmp_dir = tempfile.mkdtemp(prefix="gh-repo-")
             try:
@@ -408,7 +408,6 @@ def scan_commits(repos: Dict[str, List[dict]], db_path: Path | None = None) -> N
                     )
                 except RunCmdError as err:
                     print(f"[!] git clone failed: {err} — skipping this repository")
-                    skipped_repo = True
                     continue
 
                 for c in commits:
@@ -444,10 +443,7 @@ def scan_commits(repos: Dict[str, List[dict]], db_path: Path | None = None) -> N
                 except OSError:
                     print(f"    Error cleaning up temporary directory: {tmp_dir}")
 
-            if skipped_repo:
-                print("[!] Repo skipped due to earlier errors")
-            else:
-                print(f"[✓] {commit_counter} commits scanned.")
+            print(f"[✓] {commit_counter} commits scanned.")
     finally:
         if findings_conn:
             findings_conn.close()
